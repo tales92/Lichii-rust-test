@@ -450,9 +450,7 @@ impl GameList {
                 for (index, entry) in entries.iter().enumerate() {
                     let event = match read_metadata(entry, &options, Some(&cache)) {
                         Ok((meta, icon)) => ScanEvent::Metadata(index, meta, icon),
-                        Err(MetadataError::NotBootable) => {
-                            ScanEvent::Rejected(entry.path.clone())
-                        }
+                        Err(MetadataError::NotBootable) => ScanEvent::Rejected(entry.path.clone()),
                         Err(MetadataError::Unavailable) => continue,
                     };
                     if tx.send(event).is_err() {
@@ -504,7 +502,8 @@ impl GameList {
         }
         if finished {
             if !self.rejected.is_empty() {
-                self.entries.retain(|entry| !self.rejected.contains(&entry.path));
+                self.entries
+                    .retain(|entry| !self.rejected.contains(&entry.path));
                 self.icons.retain(|path, _| !self.rejected.contains(path));
                 self.new_icons
                     .retain(|(path, _)| !self.rejected.contains(path));
