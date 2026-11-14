@@ -277,6 +277,30 @@ impl RangeSet {
         }
     }
 
+    fn covers(&self, start: u64, end: u64) -> bool {
+        self.ranges
+            .range(..=start)
+            .next_back()
+            .is_some_and(|(_, &e)| e >= end)
+    }
+
+    /// The smallest range holding `[start, end)` and every range of the set it touches.
+    fn area(&self, start: u64, end: u64) -> (u64, u64) {
+        let first = self
+            .ranges
+            .range(..start)
+            .next_back()
+            .filter(|(_, e)| **e > start)
+            .map_or(start, |(&s, _)| s);
+        let last = self
+            .ranges
+            .range(..end)
+            .next_back()
+            .filter(|(_, e)| **e > start)
+            .map_or(end, |(_, &e)| e.max(end));
+        (first, last)
+    }
+
     fn intersects(&self, start: u64, end: u64) -> bool {
         self.ranges
             .range(..end)
@@ -670,6 +694,9 @@ pub struct BufferCache {
     buffers: Vec<Option<CachedBuffer>>,
     free_slots: Vec<usize>,
     gpu_written: RangeSet,
+    /// Whether GPU-written ranges trap guest CPU accesses until they are downloaded
+    /// ([`lichii_gpu::gpu::flush_traps_enabled`]).
+    flush_traps: bool,
     stream: StreamRing,
     readback: Option<Buffer>,
     luts: [QuadLut; 2],
@@ -703,6 +730,7 @@ impl BufferCache {
             buffers: Vec::new(),
             free_slots: Vec::new(),
             gpu_written: RangeSet::default(),
+            flush_traps: lichii_gpu::gpu::flush_traps_enabled(),
             stream: StreamRing::new(device, STREAM_RING_SIZE)?,
             readback: None,
             luts: Default::default(),
@@ -758,6 +786,7 @@ impl BufferCache {
         }
         if self.gpu_written.intersects(daddr, end) {
             self.gpu_written.subtract(daddr, end);
+            self.disarm_written_back(daddr, end);
         }
         self.cpu_written(daddr, size);
     }
@@ -785,14 +814,53 @@ impl BufferCache {
     }
 
     /// The GPU wrote `[daddr, +size)` (storage writes, transform feedback, copies): the bytes
-    /// stay in the host buffer until [`BufferCache::flush`] downloads them, and the pages are
-    /// marked in the written-pages bitmap. Called when the writing work is recorded.
+    /// stay in the host buffer until [`BufferCache::flush`] downloads them, the pages are marked
+    /// in the written-pages bitmap, and guest CPU accesses to them trap until then. Called when
+    /// the writing work is recorded; a range already GPU-written costs one lookup.
     pub fn mark_gpu_written(&mut self, daddr: DAddr, size: u64) {
         let end = daddr.saturating_add(size).min(self.limit);
         if daddr < end {
             self.written_pages.mark(daddr, end - daddr);
+            if self.flush_traps && !self.gpu_written.covers(daddr, end) {
+                self.memory.arm_flush_traps(daddr, end - daddr);
+            }
             self.gpu_written.insert(daddr, end);
         }
+    }
+
+    /// Ends the flush traps of the pages of `[daddr, end)` no GPU-written byte is left on.
+    fn disarm_written_back(&self, daddr: DAddr, end: DAddr) {
+        if !self.flush_traps {
+            return;
+        }
+        let mut run: Option<DAddr> = None;
+        let mut page = daddr & !(PAGE_SIZE - 1);
+        while page < end {
+            let next = page + PAGE_SIZE;
+            if self.gpu_written.intersects(page, next) {
+                if let Some(start) = run.take() {
+                    self.memory.disarm_flush_traps(start, page - start);
+                }
+            } else {
+                run.get_or_insert(page);
+            }
+            page = next;
+        }
+        if let Some(start) = run {
+            self.memory.disarm_flush_traps(start, page - start);
+        }
+    }
+
+    /// A guest CPU thread waits on a flush trap in `[daddr, +size)`: downloads the whole
+    /// GPU-written range around it, so a CPU pass over the rest of the range traps no more.
+    pub fn flush_for_cpu_read(
+        &mut self,
+        scheduler: &mut Scheduler,
+        daddr: DAddr,
+        size: u64,
+    ) -> Result<()> {
+        let (start, end) = self.gpu_written.area(daddr, daddr.saturating_add(size));
+        self.flush(scheduler, start, end - start)
     }
 
     /// Copies the GPU-written bytes of `[daddr, +size)` back to guest memory, waiting for the GPU.
@@ -862,6 +930,7 @@ impl BufferCache {
             offset += len;
         }
         self.gpu_written.subtract(daddr, end);
+        self.disarm_written_back(daddr, end);
         self.stats.downloaded_bytes += total;
         Ok(())
     }
@@ -2005,6 +2074,122 @@ mod tests {
         expected[0x40..0x140].copy_from_slice(&0xdead_beef_u32.to_le_bytes().repeat(0x40));
         expected[0x400..0x410].copy_from_slice(&cpu);
         assert_eq!(f.guest(DADDR + 0x2000, 0x3000), expected);
+        f.assert_no_validation_errors();
+    }
+
+    /// Serves flush traps the way the GPU back does, on the test's thread: a guest CPU thread
+    /// that meets one sends its range and waits for the reply.
+    struct BackThread(parking_lot::Mutex<std::sync::mpsc::Sender<(DAddr, u64, SyncSender<()>)>>);
+
+    type SyncSender<T> = std::sync::mpsc::SyncSender<T>;
+
+    impl lichii_memory::FlushTrapHandler for BackThread {
+        fn flush_for_cpu(&self, daddr: DAddr, size: u64) {
+            let (done, wait) = std::sync::mpsc::sync_channel(1);
+            self.0.lock().send((daddr, size, done)).unwrap();
+            let _ = wait.recv();
+        }
+    }
+
+    /// GPU work writes a buffer, and a guest CPU read of it gets the GPU's bytes: the read traps,
+    /// the whole GPU-written range is downloaded once, and the next GPU write arms it again.
+    #[test]
+    fn cpu_reads_of_gpu_written_buffers_trap_until_downloaded() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let (requests, served) = std::sync::mpsc::channel();
+        f.memory
+            .set_flush_trap_handler(Some(Arc::new(BackThread(parking_lot::Mutex::new(
+                requests,
+            )))));
+        let read = |offset: u64| {
+            let (done, value) = std::sync::mpsc::channel();
+            let space = space.clone();
+            std::thread::spawn(move || done.send(space.read::<u32>(CPU_VA + offset).unwrap()));
+            value
+        };
+        let timeout = std::time::Duration::from_secs(5);
+        let binding = f.acquire(DADDR, 0x3000);
+
+        for value in [0xc0ff_ee01, 0xc0ff_ee02] {
+            f.gpu_fill(binding, 0, 0x2000, value);
+            f.cache.mark_gpu_written(DADDR, 0x2000);
+            let reader = read(0x1004);
+            let (daddr, size, done) = served.recv_timeout(timeout).expect("the read trapped");
+            assert_eq!((daddr, size), (DADDR + 0x1000, PAGE_SIZE));
+            f.cache
+                .flush_for_cpu_read(&mut f.scheduler, daddr, size)
+                .unwrap();
+            done.send(()).unwrap();
+            assert_eq!(reader.recv_timeout(timeout).unwrap(), value);
+            assert_eq!(
+                read(0x10).recv_timeout(timeout).unwrap(),
+                value,
+                "the first page was downloaded with the second"
+            );
+            assert!(served.try_recv().is_err(), "nothing else trapped");
+        }
+        assert_eq!(
+            read(0x2000).recv_timeout(timeout).unwrap(),
+            0,
+            "never GPU-written"
+        );
+
+        f.cache.flush_traps = false;
+        f.gpu_fill(binding, 0, 0x2000, 0xc0ff_ee03);
+        f.cache.mark_gpu_written(DADDR, 0x2000);
+        assert_eq!(
+            read(0x1004).recv_timeout(timeout).unwrap(),
+            0xc0ff_ee02,
+            "without flush traps the read sees guest memory"
+        );
+        assert!(served.try_recv().is_err());
+        f.assert_no_validation_errors();
+    }
+
+    /// A download of part of a page's GPU-written bytes leaves the page trapped for the rest.
+    #[test]
+    fn a_partial_download_keeps_the_trap_of_a_page_still_gpu_written() {
+        const CPU_VA: u64 = 0x1000_0000;
+        let Some(mut f) = fixture() else { return };
+        f.cache.flush_traps = true;
+        let space = Arc::new(AddressSpace::new(f.memory.physical().clone(), 39));
+        space.map(CPU_VA, 0, 0x10000, MemoryPermission::READ_WRITE);
+        f.memory.attach_process(space.clone());
+        let binding = f.acquire(DADDR, 0x2000);
+        f.gpu_fill(binding, 0, 0x2000, 0x1234_5678);
+        f.cache.mark_gpu_written(DADDR, 0x2000);
+        f.cache.flush(&mut f.scheduler, DADDR, 0x1800).unwrap();
+        let before = f.memory.take_flush_trap_stats();
+        assert_eq!((before.arms, before.disarms), (1, 1), "{before:?}");
+        f.cache
+            .flush(&mut f.scheduler, DADDR + 0x1800, 0x800)
+            .unwrap();
+        assert_eq!(
+            f.memory.take_flush_trap_stats().disarms,
+            1,
+            "the second page last"
+        );
+        f.cache.mark_gpu_written(DADDR, 0x2000);
+        f.cache.mark_gpu_written(DADDR + 0x100, 0x100);
+        assert_eq!(
+            f.memory.take_flush_trap_stats().arms,
+            1,
+            "a range already GPU-written arms nothing"
+        );
+        f.cache.flush(&mut f.scheduler, DADDR, 0x2000).unwrap();
+        let before = allocations();
+        f.memory.arm_flush_traps(DADDR, 0x2000);
+        f.memory.disarm_flush_traps(DADDR, 0x2000);
+        assert_eq!(
+            allocations() - before,
+            0,
+            "arming and disarming again reuse their scratch"
+        );
         f.assert_no_validation_errors();
     }
 

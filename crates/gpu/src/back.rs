@@ -14,13 +14,16 @@ use crate::backend::{
     ChannelId, FenceAction, FramebufferConfig, GpuHandles, GpuWrittenPages, Rasterizer, ReleaseSize,
 };
 use crate::clock::GpuTimestamp;
+use crate::cpu_reads::CpuReads;
 use crate::engines::kepler_compute::pcas::QmdScheduler;
 use crate::engines::{Engine, EngineContext, EngineFactory, EngineKind};
 use crate::gmmu::{Gmmu, RangeTarget};
 use crate::gpu::{MAX_POLL, MIN_POLL};
 use crate::host1x::Syncpoints;
 use crate::ring::{Consumer, WRAP};
-use crate::stream::{FetchSync, FetchSyncs, MULTI_MAX_WORDS, REDUCTIONS, RELEASE_SIZES, tag};
+use crate::stream::{
+    FetchSync, FetchSyncs, MULTI_MAX_WORDS, OVERLAY_WORDS, REDUCTIONS, RELEASE_SIZES, tag,
+};
 use crate::throttle::Throttle;
 
 /// The back reports progress at least this often while it executes.
@@ -74,9 +77,19 @@ pub(crate) struct Back {
     activity: Arc<Activity>,
     /// Set by [`crate::Gpu::shutdown`]: the back drops what is left instead of executing it.
     stopping: Arc<AtomicBool>,
+    cpu_reads: Arc<CpuReads>,
+    /// Scratch for [`CpuReads::serve`].
+    cpu_read_ranges: Vec<(DAddr, u64)>,
+}
+
+impl Drop for Back {
+    fn drop(&mut self) {
+        self.cpu_reads.close();
+    }
 }
 
 impl Back {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         rasterizer: Box<dyn Rasterizer>,
         handles: &GpuHandles,
@@ -85,6 +98,7 @@ impl Back {
         fetch_syncs: Arc<FetchSyncs>,
         activity: Arc<Activity>,
         stopping: Arc<AtomicBool>,
+        cpu_reads: Arc<CpuReads>,
     ) -> Self {
         Self {
             rasterizer,
@@ -102,11 +116,15 @@ impl Back {
             written_pages: handles.written_pages.clone(),
             activity,
             stopping,
+            cpu_reads,
+            cpu_read_ranges: Vec::new(),
         }
     }
 
-    /// Executes everything published, until the ring is empty.
+    /// Executes everything published, until the ring is empty. Guest CPU reads are served first
+    /// and between records.
     pub(crate) fn run(&mut self, consumer: &mut Consumer) {
+        self.serve_cpu_reads();
         while consumer.refill() {
             self.drain_cpu_writes();
             while consumer.has_slots() {
@@ -114,6 +132,7 @@ impl Back {
                     self.abandon(consumer);
                     return;
                 }
+                self.serve_cpu_reads();
                 let header = consumer.slot(0);
                 if header == WRAP {
                     consumer.wrap();
@@ -137,6 +156,25 @@ impl Back {
         consumer.skip_published();
         consumer.release();
         while self.side.try_recv().is_ok() {}
+    }
+
+    /// Writes back the ranges guest CPU threads wait for, from the work executed so far.
+    #[inline]
+    fn serve_cpu_reads(&mut self) {
+        if self.cpu_reads.pending() {
+            self.serve_cpu_reads_now();
+        }
+    }
+
+    #[cold]
+    fn serve_cpu_reads_now(&mut self) {
+        self.flush_engine();
+        let _waiting = self.activity.waiting(Wait::HostGpu);
+        let rasterizer = &mut *self.rasterizer;
+        self.cpu_reads
+            .serve(&mut self.cpu_read_ranges, |daddr, size| {
+                rasterizer.flush_for_cpu_read(daddr, size)
+            });
     }
 
     /// Drops the renderer's copies of device memory the guest CPU wrote while a cache held it.
@@ -283,7 +321,15 @@ impl Back {
                 1
             }
             tag::SYNCHRONIZE_READ => {
-                self.synchronize_read(consumer.slot(1), consumer.slot(2));
+                let (address, size) = (consumer.slot(1), consumer.slot(2));
+                let pending = self.pending_releases(address, size);
+                let waits = pending.is_none();
+                self.fetch_syncs
+                    .read_overlay
+                    .set(pending.unwrap_or_default());
+                if waits {
+                    self.synchronize_read(address, size);
+                }
                 3
             }
             tag::SYNCHRONIZE_FETCH => {
@@ -417,6 +463,42 @@ impl Back {
                 RangeTarget::Device(daddr) => rasterizer.synchronize_region(daddr, range.size),
                 _ => rasterizer.release_fences(true),
             });
+    }
+
+    /// The words of `[address, address + size)` that semaphore releases still on their way write,
+    /// by index, when GPU work never wrote its pages and the renderer holds no other pending write
+    /// there: the read takes guest memory with these over it and needs no wait. None when the
+    /// read must synchronize.
+    fn pending_releases(
+        &mut self,
+        address: u64,
+        size: u64,
+    ) -> Option<[Option<u32>; OVERLAY_WORDS]> {
+        let channel = self
+            .current
+            .and_then(|index| self.channels[index].as_ref())?;
+        if !address.is_multiple_of(4) || size > 4 * OVERLAY_WORDS as u64 {
+            return None;
+        }
+        let rasterizer = &mut *self.rasterizer;
+        let written_pages = &self.written_pages;
+        let mut words = [None; OVERLAY_WORDS];
+        let mut known = true;
+        channel.setup.memory.for_each_range(address, size, |range| {
+            let RangeTarget::Device(daddr) = range.target else {
+                known = false;
+                return;
+            };
+            if !known || written_pages.may_be_written(daddr, range.size) {
+                known = false;
+                return;
+            }
+            let base = range.gpu_va - address;
+            known = rasterizer.pending_semaphore_words(daddr, range.size, &mut |at, word| {
+                words[((base + at - daddr) / 4) as usize] = Some(word);
+            });
+        });
+        (known && words.iter().any(Option::is_some)).then_some(words)
     }
 
     /// Whether GPU work may have written a page of the current channel's `[address, +size)`.

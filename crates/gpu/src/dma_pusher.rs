@@ -900,6 +900,7 @@ impl MacroHost for FrontMacroHost<'_> {
             tracing::warn!(?fault, "MME DMA read from unmapped GPU memory");
             out.fill(0);
         }
+        self.stream.overlay_read(out);
     }
 }
 
@@ -951,6 +952,7 @@ mod tests {
             fetch_syncs.clone(),
             Arc::new(crate::activity::Activity::new()),
             Arc::default(),
+            Arc::new(crate::cpu_reads::CpuReads::new(Box::new(|| {}))),
         );
         let mut shared = FrontShared {
             stream: Stream::new(
