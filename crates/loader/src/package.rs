@@ -25,7 +25,13 @@ use crate::title::{ICON_LANGUAGES, LoadOptions, TitleFormat, TitleInfo};
 
 const BASE_TITLE_ID_MASK: u64 = !0x1fff;
 const PROGRAM_INDEX_MASK: u64 = 0x7ff;
+/// Title ID bit used by patch/update and add-on content, neither of which is a base game.
+const NON_APPLICATION_TITLE_BITS: u64 = 0x1800;
 const XCI_KEY_AREA_SIZE: u64 = 0x1000;
+
+fn is_application_program_id(program_id: u64) -> bool {
+    program_id & NON_APPLICATION_TITLE_BITS == 0
+}
 
 /// Recognises an NSP or XCI by its contents, or a Program NCA by its header. An encrypted NCA
 /// header needs `header_key`; without it a `.nca` file is taken on its extension.
@@ -58,7 +64,10 @@ fn nca_format(file: &FileRef, path: &Path, keys: Option<&KeySet>) -> Option<Titl
     if (plaintext || keys.header_key().is_ok())
         && let Ok(nca) = Nca::open(file.clone(), keys)
     {
-        return (nca.header().content_type == NcaContentType::Program).then_some(TitleFormat::Nca);
+        let header = nca.header();
+        return (header.content_type == NcaContentType::Program
+            && is_application_program_id(header.program_id))
+        .then_some(TitleFormat::Nca);
     }
     path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("nca"))
@@ -1115,4 +1124,13 @@ mod tests {
         };
         assert!(matches!(load(&good, &options), Err(LoaderError::Io(_))));
     }
+    #[test]
+    fn standalone_nca_detection_accepts_only_application_programs() {
+        let application = 0x0100_0000_0001_0000u64;
+        assert!(is_application_program_id(application));
+        assert!(is_application_program_id(application | 0x0001));
+        assert!(!is_application_program_id(application | 0x0800));
+        assert!(!is_application_program_id(application | 0x1000));
+    }
+
 }
