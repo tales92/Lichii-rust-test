@@ -668,30 +668,27 @@ fn render_targets_sampled_later_reuse_the_gpu_written_image() {
 }
 
 #[test]
-fn incompatible_overlaps_stay_live_and_take_newer_texels_through_guest_memory() {
+fn incompatible_overlaps_stay_live_and_new_images_take_newer_texels_on_the_gpu() {
     let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
         return;
     };
     let info = rt_info(64, 64, 3, GobLayout::Tegra);
     let target = clear_rt(&mut f, &info, [0.0, 1.0, 0.0, 1.0], Rect::ALL);
     assert_eq!(info.size_bytes(), 16 << 10);
+    let traffic = f.cache.traffic();
     let (id, _) = f.texture(&tic(0x08, GPU_VA, 128, 32, 1, 1, 2));
+    let after = f.cache.traffic();
     assert_ne!(id, target.id);
     assert!(
         f.cache.state(target.id).is_some(),
         "the render target stays live"
     );
     assert_eq!(f.cache.len(), 2);
-    let mut guest = vec![0; 16 << 10];
-    f.memory.read_bytes(DADDR, &mut guest).unwrap();
-    assert!(
-        guest
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .all(|t| *t == [0, 255, 0, 255]),
-        "flushed first"
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
     );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
     assert!(
         f.read_image(id)[0]
             .as_chunks::<4>()
@@ -2286,10 +2283,11 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
         wide.format = format;
         narrow.format = format;
         let target = clear(&mut f, &wide, 0.5, 0x5a, Rect::ALL);
-        if f.cache.get(target.id).unwrap().host.format != vk::Format::D24_UNORM_S8_UINT {
-            eprintln!("skipping: no host D24S8");
-            return;
-        }
+        let float_depth = match f.cache.get(target.id).unwrap().host.format {
+            vk::Format::D24_UNORM_S8_UINT => false,
+            vk::Format::D32_SFLOAT_S8_UINT => true,
+            host => panic!("{format:?} held as {host:?}"),
+        };
         clear(
             &mut f,
             &narrow,
@@ -2322,7 +2320,12 @@ fn depth_stencil_overlaps_sync_on_the_gpu() {
             } else {
                 (0x80_0000, 0x5a)
             };
-            let d = u32::from_le_bytes(*word) & 0xff_ffff;
+            let word = u32::from_le_bytes(*word);
+            let d = if float_depth {
+                (f64::from(f32::from_bits(word)) * 16_777_215.0).round() as u32
+            } else {
+                word & 0xff_ffff
+            };
             assert!(
                 d.abs_diff(want_depth) <= 1,
                 "{format:?}: depth {d:#x} at ({x}, {y})"
@@ -2726,6 +2729,78 @@ fn images_split_across_device_ranges_sync_on_the_gpu() {
             .iter()
             .all(|t| *t == [0, 255, 0, 255]),
         "the shared range takes the render target's texels"
+    );
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn images_the_cpu_wrote_upload_those_writes_and_sync_overlaps_on_the_gpu() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 128, 128, 2, 1, 4);
+    let pattern: Vec<u8> = (0..0x2_0000).map(|i: u32| (i * 7 + i / 89) as u8).collect();
+    f.memory.write_bytes(DADDR, &pattern).unwrap();
+    let (texture, _) = f.texture(&header);
+    f.memory.write_bytes(DADDR, &[0x5a; 0x1_0000]).unwrap();
+    f.cache.cpu_written(DADDR, 0x1_0000);
+    let target = rt_info(128, 128, 3, GobLayout::Tegra);
+    clear_rt_at(
+        &mut f,
+        GPU_VA + 0x1_0000,
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let texels = f.read_image(texture);
+    assert!(all_texels(&texels[0], [0x5a; 4]), "the CPU's bytes");
+    assert!(all_texels(&texels[1], GREEN), "the render target's texels");
+    f.assert_no_validation_errors();
+}
+
+#[test]
+fn overlaps_the_cpu_wrote_sync_on_the_gpu_with_those_writes() {
+    let Some(mut f) = fixture(GobLayout::Tegra, AstcRecompression::Uncompressed) else {
+        return;
+    };
+    let header = tic(0x08, GPU_VA, 128, 128, 2, 1, 4);
+    let (texture, _) = f.texture(&header);
+    let target = rt_info(128, 128, 3, GobLayout::Tegra);
+    let rt = clear_rt_at(
+        &mut f,
+        GPU_VA + 0x1_0000,
+        &target,
+        [0.0, 1.0, 0.0, 1.0],
+        Rect::ALL,
+    );
+    f.memory.write_bytes(DADDR + 0x1_0008, &[9; 4]).unwrap();
+    {
+        let (mut tx, cache, _) = f.tx();
+        cache.invalidate(&mut tx, DADDR + 0x1_0008, 4).unwrap();
+    }
+    assert!(f.cache.state(rt.id).unwrap().cpu_dirty);
+    let traffic = f.cache.traffic();
+    assert_eq!(f.texture(&header).0, texture);
+    let after = f.cache.traffic();
+    assert_eq!(
+        after.downloads, traffic.downloads,
+        "no write-back to guest memory"
+    );
+    assert_eq!(after.gpu_syncs, traffic.gpu_syncs + 1);
+    let layer = &f.read_image(texture)[1];
+    assert_eq!(count_texels(layer, [9; 4]), 1, "the CPU's bytes");
+    assert_eq!(
+        count_texels(layer, GREEN),
+        layer.len() / 4 - 1,
+        "the render target's texels"
     );
     f.assert_no_validation_errors();
 }

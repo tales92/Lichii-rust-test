@@ -46,8 +46,8 @@ pub(super) const STAND_INS: [&[u8]; FONT_COUNT] = [
 /// Plain TrueType/OpenType data of each font type, `None` when the font was not found.
 pub(super) type FontData = [Option<Vec<u8>>; FONT_COUNT];
 
-/// Looks for every font: first in the NAND system archives, then in the fonts directory. Without
-/// any font in either, every type gets its stand-in.
+/// Looks for every font: first in the NAND system archives, then in the fonts directory. Each
+/// missing type gets its stand-in, preserving every real font that was found.
 pub(super) fn find(settings: &Settings) -> FontData {
     let nand = settings
         .paths
@@ -64,14 +64,24 @@ pub(super) fn find(settings: &Settings) -> FontData {
     let mut fonts: FontData = Default::default();
     from_system_archives(&registered, &keys, &mut fonts);
     from_font_files(&fonts_dir, &mut fonts);
-    if fonts.iter().all(Option::is_none) {
+    let missing = fonts.iter().filter(|font| font.is_none()).count();
+    if missing != 0 {
         tracing::warn!(
+            missing,
             searched = ?[registered, fonts_dir],
-            "no shared fonts found: pl:u serves open-source stand-ins"
+            "using open-source stand-ins for shared fonts that were not found"
         );
-        return STAND_INS.map(|font| Some(font.to_vec()));
+        fill_missing(&mut fonts);
     }
     fonts
+}
+
+fn fill_missing(fonts: &mut FontData) {
+    for (font, stand_in) in fonts.iter_mut().zip(STAND_INS) {
+        if font.is_none() {
+            *font = Some(stand_in.to_vec());
+        }
+    }
 }
 
 fn from_system_archives(registered: &Path, keys_dir: &Path, fonts: &mut FontData) {
@@ -163,4 +173,26 @@ pub(super) fn shared_memory_header(size: u32) -> [u8; 8] {
     header[..4].copy_from_slice(&DECRYPTED_MAGIC.swap_bytes().to_le_bytes());
     header[4..].copy_from_slice(&(size ^ FONT_KEY).to_le_bytes());
     header
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_font_slots_use_stand_ins_without_replacing_found_fonts() {
+        let mut fonts: FontData = Default::default();
+        fonts[1] = Some(vec![1, 2, 3]);
+        fill_missing(&mut fonts);
+
+        assert_eq!(fonts[1].as_deref(), Some(&[1, 2, 3][..]));
+        for (index, (font, stand_in)) in fonts.iter().zip(STAND_INS).enumerate() {
+            assert!(
+                font.as_ref().is_some_and(|data| !data.is_empty()),
+                "font slot {index} must be filled"
+            );
+            if index != 1 {
+                assert_eq!(font.as_deref(), Some(stand_in));
+            }
+        }
+    }
 }
