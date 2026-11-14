@@ -1,0 +1,91 @@
+name: Publish verified Lichii build
+
+on:
+  push:
+    branches:
+      - publish-verified-build-2026-11-14
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    name: Package and publish Windows x64 preview
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the successful Windows build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: lichii-windows-x64
+          path: dist
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: ${{ github.repository }}
+          run-id: 43625385243
+
+      - name: Verify required files
+        run: |
+          test -s dist/lichii.exe
+          test -s dist/avcodec-61.dll
+          test -s dist/avutil-59.dll
+          test -s dist/FFMPEG-LICENSE.txt
+          test -s dist/FFMPEG-SOURCE.txt
+          file dist/lichii.exe dist/avcodec-61.dll dist/avutil-59.dll
+
+      - name: Add Portuguese installation notes
+        run: |
+          cat > dist/LEIA-ME-PT-BR.txt <<'EOF'
+          LICHII RUST — WINDOWS x64 (VERSÃO DE TESTE)
+
+          INSTALAÇÃO
+          1. Extraia todos os arquivos deste pacote para a mesma pasta.
+          2. Mantenha avcodec-61.dll e avutil-59.dll ao lado de lichii.exe.
+          3. Execute lichii.exe.
+
+          OBSERVAÇÕES
+          - Esta é uma compilação experimental; compatibilidade com jogos não foi validada.
+          - O backend gráfico do projeto utiliza Vulkan. Mantenha os drivers da GPU atualizados.
+          - As DLLs do FFmpeg estão incluídas para os recursos de vídeo/cutscenes.
+          - Consulte o README do repositório para conhecer o estado do projeto e limitações.
+
+          REPOSITÓRIO
+          https://github.com/tales92/Lichii-rust-test
+          Build de origem: ae60cd4f966b005d3e16ba677f3e8008be5fa6c7
+          Execução de CI: https://github.com/tales92/Lichii-rust-test/actions/runs/43625385243
+          EOF
+
+      - name: Create release archive and SHA-256 checksum
+        run: |
+          cd dist
+          zip -9 ../lichii-windows-x64.zip lichii.exe avcodec-61.dll avutil-59.dll FFMPEG-LICENSE.txt FFMPEG-SOURCE.txt LEIA-ME-PT-BR.txt
+          cd ..
+          sha256sum lichii-windows-x64.zip > lichii-windows-x64.zip.sha256
+
+      - name: Publish GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-preview-2026-11-14
+          name: Lichii Rust — Windows x64 Preview (2026-11-14)
+          target_commitish: ae60cd4f966b005d3e16ba677f3e8008be5fa6c7
+          prerelease: true
+          draft: false
+          fail_on_unmatched_files: true
+          files: |
+            lichii-windows-x64.zip
+            lichii-windows-x64.zip.sha256
+          body: |
+            ## Lichii Rust — Windows x64 Preview
+
+            Compilação experimental do fork `tales92/Lichii-rust-test`, gerada pelo GitHub Actions.
+
+            **Pacote:** `lichii-windows-x64.zip` — inclui `lichii.exe`, as DLLs `avcodec-61.dll` e `avutil-59.dll`, os arquivos de licença/origem do FFmpeg e instruções em português.
+
+            **Requisitos:** Windows x64 e GPU/driver compatível com Vulkan.
+
+            **Validação desta publicação:** os jobs de compilação de FFmpeg e do Lichii terminaram com sucesso; o ZIP foi verificado e os binários foram identificados como PE x64. A execução do emulador e a compatibilidade com jogos ainda não foram testadas.
+
+            **Build de origem:** `ae60cd4f966b005d3e16ba677f3e8008be5fa6c7`
+
+            **Execução do GitHub Actions:** https://github.com/tales92/Lichii-rust-test/actions/runs/43625385243
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
