@@ -1,12 +1,12 @@
 name: Release
 
-# A Windows build of the desktop app with the FFmpeg DLLs it loads next to lichii.exe.
-
 on:
   workflow_dispatch:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [upstream-sync-fixes-v0.1.0, main]
+
+permissions:
+  contents: write
 
 jobs:
   ffmpeg-windows:
@@ -23,9 +23,84 @@ jobs:
         with:
           name: ffmpeg-windows
           path: dist
-      - run: cargo build --release -p lichii
-      - run: Copy-Item target/release/lichii.exe dist/
-      - uses: actions/upload-artifact@v4
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version\\s*=\\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Could not read [workspace.package] version from Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build Lichii
+        run: cargo build --release -p lichii
+      - name: Package versioned Windows x64 ZIP
+        id: package
+        shell: pwsh
+        run: |
+          Copy-Item target/release/lichii.exe dist/
+          @"
+          Lichii Rust v${{ steps.version.outputs.version }} — Windows x64
+
+          INSTALAÇÃO
+          Extraia todos os arquivos deste ZIP para a mesma pasta e execute lichii.exe.
+          Mantenha avcodec-61.dll e avutil-59.dll ao lado do executável.
+
+          VERSÃO
+          ${{ steps.version.outputs.version }}
+
+          BUILD
+          Commit: ${{ github.sha }}
+          Upstream: zortos293/Lichii-rust @ d642ce73f289a43134286c715a225bd7047d40d1
+
+          OBSERVAÇÕES
+          Esta é uma compilação experimental. A compilação não garante compatibilidade com todos os jogos.
+          O backend gráfico usa Vulkan.
+          Os arquivos de licença e origem do FFmpeg estão incluídos.
+          "@ | Set-Content -Path dist/LEIA-ME-PT-BR.txt -Encoding utf8
+          $zip = "Lichii-v${{ steps.version.outputs.version }}-Windows-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $checksum = "$hash  $zip"
+          Set-Content -Path "$zip.sha256" -Value $checksum -Encoding ascii
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "checksum=$zip.sha256" >> $env:GITHUB_OUTPUT
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: lichii-windows-x64
-          path: dist
+          name: lichii-v${{ steps.version.outputs.version }}-windows-x64
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.checksum }}
+      - name: Publish versioned GitHub pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}-preview.${{ github.run_number }}
+          name: Lichii Rust v${{ steps.version.outputs.version }} — Windows x64 (Preview #${{ github.run_number }})
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          draft: false
+          make_latest: false
+          fail_on_unmatched_files: true
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.checksum }}
+          body: |
+            ## Lichii Rust v${{ steps.version.outputs.version }} — Windows x64
+
+            Pré-release experimental do fork `tales92/Lichii-rust-test`, sincronizada com o upstream `zortos293/Lichii-rust`.
+
+            - **Versão do aplicativo:** ${{ steps.version.outputs.version }}
+            - **Pacote:** ${{ steps.package.outputs.zip }}
+            - **Arquitetura:** Windows x64
+            - **Gráficos:** Vulkan
+            - **FFmpeg:** DLLs incluídas junto ao executável
+
+            Inclui correção para preencher individualmente slots de fontes do sistema que estiverem ausentes e filtragem de pacotes sem aplicativo (atualizações/DLC) na lista de jogos. Entradas que não puderem ser lidas por falta de chaves permanecem visíveis.
+
+            Esta compilação é experimental. A CI verifica formatação, análise estática e testes automatizados; isso não equivale a validar todos os jogos em execução.
+
+            **Upstream:** `d642ce73f289a43134286c715a225bd7047d40d1`
+
+            **Commit desta build:** `${{ github.sha }}`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
