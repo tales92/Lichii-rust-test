@@ -12,7 +12,7 @@ use crossbeam_channel::{Receiver, TryRecvError};
 use lichii_common::ConsoleGeneration;
 use lichii_common::settings::Language;
 use lichii_fs::nacp::NacpLanguage;
-use lichii_loader::LoadOptions;
+use lichii_loader::{LoadOptions, LoaderError};
 use serde::{Deserialize, Serialize};
 
 /// How deep below a game directory to look.
@@ -225,7 +225,8 @@ pub struct MetadataCache {
 
 impl MetadataCache {
     pub fn new(dir: PathBuf, keys_dir: &Path, installed: &[PathBuf]) -> Self {
-        let mut bytes = keys_dir.to_string_lossy().into_owned().into_bytes();
+        let mut bytes = b"game-list-metadata-v2".to_vec();
+        bytes.extend(keys_dir.to_string_lossy().into_owned().into_bytes());
         for name in ["prod.keys", "console.keys", "title.keys"] {
             let (size, modified) = file_time(&keys_dir.join(name)).unwrap_or_default();
             bytes.extend(size.to_le_bytes());
@@ -268,14 +269,29 @@ fn fnv1a(bytes: impl IntoIterator<Item = u8>) -> u64 {
     })
 }
 
-/// Reads a title's metadata and icon, from `cache` when neither the file nor the keys have
-/// changed since. Titles that do not open (no keys yet, a damaged file) have none and are not
-/// cached, so they are read again once the keys are set up.
-pub fn read_metadata(
+/// Whether a scanned file is a bootable title or a package that needs attention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MetadataError {
+    NotBootable,
+    Unavailable,
+}
+
+fn classify_metadata_error(error: &LoaderError) -> MetadataError {
+    match error {
+        LoaderError::MissingProgram(_)
+        | LoaderError::NotATitle(_)
+        | LoaderError::MissingNupProgram(_) => MetadataError::NotBootable,
+        _ => MetadataError::Unavailable,
+    }
+}
+
+/// Reads a title's metadata, rejecting confirmed update/DLC-only containers while preserving
+/// unreadable entries so missing keys never make a valid game disappear.
+fn read_metadata(
     entry: &GameEntry,
     options: &LoadOptions,
     cache: Option<&MetadataCache>,
-) -> Option<(Metadata, Option<Icon>)> {
+) -> Result<(Metadata, Option<Icon>), MetadataError> {
     let cache = cache
         .filter(|_| entry.kind != GameKind::ExeFs)
         .and_then(|cache| {
@@ -285,11 +301,15 @@ pub fn read_metadata(
             ))
         });
     if let Some(hit) = cache.as_ref().and_then(|(dir, stamp)| stamp.load(dir)) {
-        return Some(hit);
+        return Ok(hit);
     }
-    let info = lichii_loader::scan(&entry.path, options)
-        .inspect_err(|e| tracing::debug!(path = %entry.path.display(), "no title metadata: {e}"))
-        .ok()?;
+    let info = match lichii_loader::scan(&entry.path, options) {
+        Ok(info) => info,
+        Err(error) => {
+            tracing::debug!(path = %entry.path.display(), "no title metadata: {error}");
+            return Err(classify_metadata_error(&error));
+        }
+    };
     let meta = Metadata {
         title: info.name,
         publisher: info.publisher,
@@ -301,7 +321,7 @@ pub fn read_metadata(
     if let Some((dir, stamp)) = &cache {
         stamp.store(dir, &meta, icon.as_ref());
     }
-    Some((meta, icon))
+    Ok((meta, icon))
 }
 
 /// What identifies one version of a file, read in one language with one set of keys, in the
@@ -379,6 +399,7 @@ impl Stamp {
 enum ScanEvent {
     Listed(Vec<GameEntry>),
     Metadata(usize, Metadata, Option<Icon>),
+    Rejected(PathBuf),
     Done,
 }
 
@@ -402,6 +423,7 @@ pub struct GameList {
     /// Icon textures by title path, uploaded as their metadata arrives.
     pub icons: HashMap<PathBuf, egui::TextureHandle>,
     new_icons: Vec<(PathBuf, Icon)>,
+    rejected: Vec<PathBuf>,
     pending: Option<Receiver<ScanEvent>>,
 }
 
@@ -427,10 +449,12 @@ impl GameList {
                     ..LoadOptions::default()
                 };
                 for (index, entry) in entries.iter().enumerate() {
-                    let Some((meta, icon)) = read_metadata(entry, &options, Some(&cache)) else {
-                        continue;
+                    let event = match read_metadata(entry, &options, Some(&cache)) {
+                        Ok((meta, icon)) => ScanEvent::Metadata(index, meta, icon),
+                        Err(MetadataError::NotBootable) => ScanEvent::Rejected(entry.path.clone()),
+                        Err(MetadataError::Unavailable) => continue,
                     };
-                    if tx.send(ScanEvent::Metadata(index, meta, icon)).is_err() {
+                    if tx.send(event).is_err() {
                         return;
                     }
                     wake();
@@ -458,6 +482,7 @@ impl GameList {
                     self.entries = entries;
                     self.icons.clear();
                     self.new_icons.clear();
+                    self.rejected.clear();
                 }
                 Ok(ScanEvent::Metadata(index, meta, icon)) => {
                     let Some(entry) = self.entries.get_mut(index) else {
@@ -468,6 +493,7 @@ impl GameList {
                         self.new_icons.push((entry.path.clone(), icon));
                     }
                 }
+                Ok(ScanEvent::Rejected(path)) => self.rejected.push(path),
                 Ok(ScanEvent::Done) | Err(TryRecvError::Disconnected) => {
                     finished = true;
                     break;
@@ -476,6 +502,14 @@ impl GameList {
             }
         }
         if finished {
+            if !self.rejected.is_empty() {
+                self.entries
+                    .retain(|entry| !self.rejected.contains(&entry.path));
+                self.icons.retain(|path, _| !self.rejected.contains(path));
+                self.new_icons
+                    .retain(|(path, _)| !self.rejected.contains(path));
+                self.rejected.clear();
+            }
             sort(&mut self.entries);
             self.pending = None;
         }
@@ -529,6 +563,25 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_confirmed_non_bootable_packages_are_rejected() {
+        for error in [
+            LoaderError::MissingProgram("update.nsp".into()),
+            LoaderError::NotATitle("addon.nca".into()),
+            LoaderError::MissingNupProgram("update.nup".into()),
+        ] {
+            assert_eq!(classify_metadata_error(&error), MetadataError::NotBootable);
+        }
+
+        let missing_key = LoaderError::Key(lichii_crypto::KeyError::Missing("header_key".into()));
+        assert_eq!(
+            classify_metadata_error(&missing_key),
+            MetadataError::Unavailable
+        );
+        let io = LoaderError::Io(std::io::Error::other("unreadable package"));
+        assert_eq!(classify_metadata_error(&io), MetadataError::Unavailable);
+    }
 
     struct TempDir(PathBuf);
 
@@ -808,7 +861,7 @@ mod tests {
         tmp.file("Locked.nsp", 0x400);
         let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"), &[]);
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
-        assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_none());
+        assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_err());
         assert!(!cache.dir.exists());
         assert_eq!(game.title(), "Locked");
     }

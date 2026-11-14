@@ -583,6 +583,15 @@ pub trait Rasterizer: Send {
     /// Write GPU-modified data in `[addr, addr + size)` back to guest memory.
     fn flush_region(&mut self, addr: DAddr, size: u64);
 
+    /// A guest CPU thread touched `[addr, addr + size)`, a page under a flush trap the renderer
+    /// armed ([`DeviceAddressSpace::arm_flush_traps`](lichii_memory::DeviceAddressSpace::arm_flush_traps)),
+    /// and waits: write its GPU-modified data back and disarm what was written back. A renderer
+    /// may write back the whole GPU-written area around the page, so a CPU pass over a large
+    /// buffer traps once. The default writes back the range.
+    fn flush_for_cpu_read(&mut self, addr: DAddr, size: u64) {
+        self.flush_region(addr, size);
+    }
+
     /// The front is about to read `[addr, addr + size)`: every GPU writer of the range lands in
     /// guest memory first (releases still waiting for host GPU work, and cached buffers and
     /// images). The default waits for every fence, then writes the range back; a renderer that
@@ -590,6 +599,20 @@ pub trait Rasterizer: Send {
     fn synchronize_region(&mut self, addr: DAddr, size: u64) {
         self.release_fences(true);
         self.flush_region(addr, size);
+    }
+
+    /// Passes `put` the words of `[addr, addr + size)` that semaphore releases still waiting in
+    /// the renderer's fences write, in the order they were signalled; a 16-byte release's
+    /// timestamp is taken now. Returns true only when every pending write the renderer holds for
+    /// the range is such a release, so its value is known; then a read needs no wait for them.
+    /// The default holds no fences it can tell apart and returns false: the caller synchronizes.
+    fn pending_semaphore_words(
+        &mut self,
+        _addr: DAddr,
+        _size: u64,
+        _put: &mut dyn FnMut(DAddr, u32),
+    ) -> bool {
+        false
     }
 
     /// Device memory `[addr, addr + size)` is no longer mapped in some GPU address space.

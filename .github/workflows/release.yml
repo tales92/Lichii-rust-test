@@ -1,31 +1,171 @@
 name: Release
 
-# A Windows build of the desktop app with the FFmpeg DLLs it loads next to lichii.exe.
+# Fork build based on upstream zortos293/Lichii-rust commit ea9c5997b73683da2a814fd71bfdcbc85083847f.
 
+# Publish only after CI succeeds on main. Manual runs are restricted to main as well.
 on:
   workflow_dispatch:
-  push:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
     branches: [main]
-    tags: ["v*"]
+
+permissions:
+  contents: write
 
 jobs:
   ffmpeg-windows:
+    if: ${{ (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success') }}
     uses: ./.github/workflows/ffmpeg-windows.yml
+    with:
+      ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
   windows:
     needs: ffmpeg-windows
+    if: ${{ needs.ffmpeg-windows.result == 'success' }}
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: actions/download-artifact@v4
         with:
           name: ffmpeg-windows
           path: dist
-      - run: cargo build --release -p lichii
-      - run: Copy-Item target/release/lichii.exe dist/
-      - uses: actions/upload-artifact@v4
+      - name: Read application version
+        id: version
+        shell: pwsh
+        run: |
+          $match = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "Could not read [workspace.package] version from Cargo.toml" }
+          $version = $match.Matches[0].Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Build Lichii
+        run: cargo build --release -p lichii
+      - name: Generate changelog for this release
+        id: changelog
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          $tags = @(git tag --list "v$env:APP_VERSION-preview.*" --sort=-version:refname)
+          if ($tags.Count -gt 0) {
+            $previousTag = $tags[0]
+            $range = "$previousTag..$env:BUILD_SHA"
+          } else {
+            $previousTag = ""
+            $range = "$env:BUILD_SHA^..$env:BUILD_SHA"
+          }
+          $commits = @(git log --no-merges --date=short --format='- %ad | %h | %s' $range)
+          if ($commits.Count -eq 0) {
+            $commits = @("- No individual commit messages were found in this comparison range.")
+          }
+          $files = @(git diff --stat $range)
+          if ($files.Count -eq 0) {
+            $files = @("No file-level diff was available for this commit.")
+          }
+          @"
+          # Lichii Rust — automatic build
+
+          - **Application version:** $env:APP_VERSION
+          - **Commit:** $env:BUILD_SHA
+          - **Comparison:** $range
+          - **Repository:** tales92/Lichii-rust-test
+
+          ## Commits included
+          $($commits -join "`n")
+
+          ## Files and change summary
+          $($files -join "`n")
+
+          ## Package contents
+          - Lichii executable for Windows x64
+          - FFmpeg runtime DLLs: avcodec-61.dll and avutil-59.dll
+          - FFmpeg source/build information and LGPL license
+          - Lichii license and fallback-font licenses/attribution
+          - Version and installation instructions
+
+          This is an experimental preview. Passing CI does not guarantee compatibility with every game.
+          "@ | Set-Content -Path release-notes.md -Encoding utf8
+          "previous_tag=$previousTag" >> $env:GITHUB_OUTPUT
+      - name: Package versioned Windows x64 ZIP
+        id: package
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          BUILD_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          foreach ($dll in @("avcodec-61.dll", "avutil-59.dll")) {
+            if (-not (Test-Path (Join-Path dist $dll))) {
+              throw "Required FFmpeg runtime DLL is missing from the downloaded artifact: $dll"
+            }
+          }
+          if (-not (Test-Path "dist/FFMPEG-LICENSE.txt") -or -not (Test-Path "dist/FFMPEG-SOURCE.txt")) {
+            throw "The FFmpeg license/source notices are missing from the downloaded artifact."
+          }
+          Copy-Item target/release/lichii.exe dist/
+          Copy-Item LICENSE dist/LICENSE-LICHII.txt
+          Copy-Item crates/services/src/pl_u/fallback/OFL.txt dist/FALLBACK-FONTS-OFL.txt
+          Copy-Item crates/services/src/pl_u/fallback/LICENSE-Apache-2.0.txt dist/FALLBACK-FONTS-LICENSE-Apache-2.0.txt
+          Copy-Item crates/services/src/pl_u/fallback/README.md dist/FALLBACK-FONTS-README.txt
+          Copy-Item release-notes.md dist/CHANGELOG.md
+          $releaseVersion = "$env:APP_VERSION-preview.${{ github.run_number }}"
+          $releaseTag = "v$releaseVersion"
+          Set-Content -Path dist/APP_VERSION.txt -Value $env:APP_VERSION -Encoding ascii
+          Set-Content -Path dist/VERSION.txt -Value $releaseVersion -Encoding ascii
+          Set-Content -Path dist/BUILD_COMMIT.txt -Value $env:BUILD_SHA -Encoding ascii
+          @"
+          Lichii Rust $releaseTag — Windows x64
+
+          INSTALAÇÃO
+          Extraia todos os arquivos deste ZIP para a mesma pasta e execute lichii.exe.
+          As DLLs avcodec-61.dll e avutil-59.dll devem permanecer ao lado do executável.
+
+          VERSÃO
+          Aplicativo: $env:APP_VERSION
+          Build: $releaseVersion
+
+          CONTEÚDO
+          Executável Lichii + DLLs FFmpeg + licenças, créditos, CHANGELOG e checksum separado.
+
+          GRÁFICOS
+          Backend Vulkan.
+
+          ESTA É UMA BUILD EXPERIMENTAL.
+          "@ | Set-Content -Path dist/LEIA-ME-PT-BR.txt -Encoding utf8
+          $zip = "Lichii-$releaseTag-Windows-x64.zip"
+          Compress-Archive -Path dist/* -DestinationPath $zip -Force
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          $checksum = "$hash  $zip"
+          Set-Content -Path "$zip.sha256" -Value $checksum -Encoding ascii
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "checksum=$zip.sha256" >> $env:GITHUB_OUTPUT
+          "release_version=$releaseVersion" >> $env:GITHUB_OUTPUT
+          "release_tag=$releaseTag" >> $env:GITHUB_OUTPUT
+      - name: Upload versioned build artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: lichii-windows-x64
-          path: dist
+          name: lichii-${{ steps.package.outputs.release_version }}-windows-x64
+          path: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.checksum }}
+      - name: Publish automatic GitHub pre-release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.package.outputs.release_tag }}
+          name: Lichii Rust v${{ steps.version.outputs.version }} — Windows x64 (Preview #${{ github.run_number }})
+          target_commitish: ${{ github.event.workflow_run.head_sha || github.sha }}
+          prerelease: true
+          draft: false
+          make_latest: false
+          fail_on_unmatched_files: true
+          body_path: release-notes.md
+          generate_release_notes: true
+          previous_tag: ${{ steps.changelog.outputs.previous_tag }}
+          files: |
+            ${{ steps.package.outputs.zip }}
+            ${{ steps.package.outputs.checksum }}

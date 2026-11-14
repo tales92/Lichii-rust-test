@@ -1,16 +1,22 @@
 name: FFmpeg for Windows
 
-# Builds the LGPL FFmpeg DLLs Lichii loads on Windows (scripts/build-ffmpeg-windows.sh) and uploads
-# them as the ffmpeg-windows artifact. Cached until the script changes.
-
+# Build the LGPL FFmpeg DLLs used by Lichii at runtime. The same artifact is consumed
+# by CI and by the automatic release workflow.
 on:
   workflow_call:
+    inputs:
+      ref:
+        description: Commit to build the FFmpeg bundle from
+        required: false
+        type: string
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.sha }}
       - id: cache
         uses: actions/cache@v4
         with:
@@ -21,7 +27,8 @@ jobs:
         run: |
           sudo apt-get update && sudo apt-get install -y mingw-w64 nasm
           scripts/build-ffmpeg-windows.sh ffmpeg-windows
-      - uses: actions/upload-artifact@v4
+      - name: Upload FFmpeg DLL bundle
+        uses: actions/upload-artifact@v4
         with:
           name: ffmpeg-windows
           path: ffmpeg-windows
