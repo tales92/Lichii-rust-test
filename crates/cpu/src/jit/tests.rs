@@ -3144,3 +3144,246 @@ fn rounding_shifts_match_the_interpreter() {
         compare(machines, &[op, BRK], &ctx, &data);
     }
 }
+
+/// `ADDV`, `XTN`/`XTN2`, `REV64` and `NEG` on every arrangement against the interpreter.
+#[test]
+fn add_across_narrow_reverse_and_negate_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for q in [0u32, 1] {
+        for size in 0..3u32 {
+            if size < 2 || q == 1 {
+                ops.push(0x0e31_b822 | q << 30 | size << 22);
+            }
+            ops.push(0x0e21_2822 | q << 30 | size << 22);
+            ops.push(0x0e20_0822 | q << 30 | size << 22);
+        }
+        for size in 0..4u32 {
+            ops.push(0x2e20_b822 | q << 30 | size << 22);
+        }
+    }
+    let mut rng = Rng(0x0e31_b822_0e21_2822);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..400 * ops.len() {
+        let lane = |rng: &mut Rng| match rng.below(3) {
+            0 => rng.interesting(),
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// Vector `FDIV`, vector and scalar `FABD`, and `FCVTZS`/`FCVTZU` (vector, scalar and vector
+/// fixed-point with every S `fbits`) against the interpreter, with lanes around the integer
+/// range, NaNs, infinities, zeros and subnormals, under FZ, other rounding modes and IXC set or
+/// clear.
+#[test]
+fn fp_division_abs_diff_and_conversions_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for base in [0x2e22_fc20u32, 0x2ea2_d420] {
+        ops.extend([base, base | 1 << 30, base | 1 << 30 | 1 << 22]);
+    }
+    ops.extend([0x7ea2_d420, 0x7ee2_d420]);
+    for base in [0x0ea1_b820u32, 0x2ea1_b820] {
+        ops.extend([
+            base,
+            base | 1 << 30,
+            base | 1 << 30 | 1 << 22,
+            base | 0x5000_0000,
+            base | 0x5000_0000 | 1 << 22,
+        ]);
+    }
+    for u in [0u32, 1] {
+        for fbits in 1..=32u32 {
+            let s = 0x0f00_fc20 | u << 29 | (64 - fbits) << 16;
+            ops.extend([s, s | 1 << 30]);
+        }
+        for fbits in [1u32, 20, 64] {
+            ops.push(0x4f00_fc20 | u << 29 | (128 - fbits) << 16);
+        }
+        ops.push(0x4fb0_fc20 | u << 29);
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let mut rng = Rng(0x2e22_fc20_0f00_fc20);
+    let lane = |rng: &mut Rng| -> u64 {
+        let s = |rng: &mut Rng| match rng.below(7) {
+            0 => rng.below(2) << 31,
+            1 => FP_S[rng.below(FP_S.len() as u64) as usize] as u64,
+            2 => rng.below(0x0080_0000) | rng.below(2) << 31,
+            3 => (0x4f00_0000 + rng.below(3) * 0x0080_0000 - rng.below(2)) | rng.below(2) << 31,
+            4 => rng.next() & 0xffff_ffff,
+            _ => (117 + rng.below(44)) << 23 | rng.below(0x0080_0000) | rng.below(2) << 31,
+        };
+        match rng.below(4) {
+            0 => FP_D[rng.below(FP_D.len() as u64) as usize],
+            1 => (990 + rng.below(70)) << 52 | rng.below(1 << 52) | rng.below(2) << 63,
+            _ => s(rng) << 32 | s(rng),
+        }
+    };
+    for i in 0..60 * ops.len() {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: match i % 7 {
+                0 | 3 => 1 << 24,
+                5 => 1 << 22,
+                _ => 0,
+            },
+            fpsr: if i % 4 == 0 { 0 } else { 0x10 },
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// `CLREX` runs in the block and drops the reservation, so the `STXR` after it fails while the
+/// next `LDXR`/`STXR` pair succeeds, as in the interpreter.
+#[test]
+fn clrex_drops_the_reservation_without_leaving_the_block() {
+    let program = [
+        0xc85f_7e81,
+        0xd503_3f5f,
+        0xc802_7e83,
+        0xc85f_7e85,
+        0xc804_7e83,
+        BRK,
+    ];
+    let mut ctx = ThreadContext {
+        pc: CODE,
+        ..Default::default()
+    };
+    ctx.x[20] = DATA;
+    ctx.x[3] = 0x1234_5678_9abc_def0;
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    compare(machines, &program, &ctx, &data);
+    let (_, out, table) = run_profiled(&program, ctx, true);
+    assert_eq!((out.x[2], out.x[4]), (1, 0));
+    assert!(!table.unwrap().contains("Clrex"));
+}
+
+/// `TRN1`/`TRN2`/`UZP1`/`UZP2`, `SMAXV`/`SMINV`/`UMAXV`/`UMINV`, `SHLL`/`SHLL2` and
+/// `SQXTUN`/`SQXTUN2` on every arrangement against the interpreter, FPSR.QC included.
+#[test]
+fn permutes_extremes_across_shll_and_sqxtun_match_the_interpreter() {
+    let mut ops = Vec::new();
+    for q in [0u32, 1] {
+        for size in 0..4u32 {
+            for opcode in [1u32, 2, 5, 6] {
+                ops.push(0x0e02_0820 | q << 30 | size << 22 | opcode << 12);
+            }
+        }
+        for size in 0..3u32 {
+            for (u, min) in [(0u32, 0u32), (0, 1), (1, 0), (1, 1)] {
+                ops.push(0x0e30_a820 | q << 30 | u << 29 | size << 22 | min << 16);
+            }
+            ops.push(0x2e21_3820 | q << 30 | size << 22);
+            ops.push(0x2e21_2820 | q << 30 | size << 22);
+        }
+    }
+    let mut rng = Rng(0x0e02_0820_2e21_2820);
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    for i in 0..100 * ops.len() {
+        let lane = |rng: &mut Rng| match rng.below(4) {
+            0 => rng.interesting(),
+            1 => (rng.below(0x1_0000) * 0x0001_0001_0001_0001) & 0x00ff_00ff_00ff_00ff,
+            _ => rng.next(),
+        };
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpsr: if i % 2 == 0 { 1 << 27 } else { 0 },
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}
+
+/// `UCVTF` (vector), scalar `FADDP` and the fixed-point scalar `FCVTZS`/`FCVTZU` to W and X
+/// registers against the interpreter, with lanes around the integer range, NaNs, infinities,
+/// zeros and subnormals, under FZ, other rounding modes and IXC set or clear.
+#[test]
+fn unsigned_conversion_pairwise_add_and_fixed_conversions_match_the_interpreter() {
+    let mut ops = vec![
+        0x2e21_d820u32,
+        0x6e21_d820,
+        0x6e61_d820,
+        0x7e30_d820,
+        0x7e70_d820,
+    ];
+    for u in [0u32, 1] {
+        for fp in [0u32, 1] {
+            for scale in [32u32, 40, 48, 63, 10] {
+                ops.push(0x1e18_0020 | fp << 22 | u << 16 | scale << 10);
+            }
+            for scale in [0u32, 20, 48, 63] {
+                ops.push(0x9e18_0020 | fp << 22 | u << 16 | scale << 10);
+            }
+        }
+    }
+    let machines = &mut [
+        ("interpreter", Machine::new(Backend::Interpreter)),
+        ("jit", Machine::new(Backend::Jit(Passes::ALL))),
+        ("jit without sse4", Machine::new(Backend::NoSse4)),
+    ];
+    let data = vec![0u8; DATA_SIZE as usize];
+    let mut rng = Rng(0x2e21_d820_1e18_0020);
+    let lane = |rng: &mut Rng| -> u64 {
+        let s = |rng: &mut Rng| match rng.below(7) {
+            0 => rng.below(2) << 31,
+            1 => FP_S[rng.below(FP_S.len() as u64) as usize] as u64,
+            2 => rng.below(0x0080_0000) | rng.below(2) << 31,
+            3 => rng.next() & 0xffff_ffff,
+            _ => (100 + rng.below(70)) << 23 | rng.below(0x0080_0000) | rng.below(2) << 31,
+        };
+        match rng.below(4) {
+            0 => FP_D[rng.below(FP_D.len() as u64) as usize],
+            1 => (980 + rng.below(90)) << 52 | rng.below(1 << 52) | rng.below(2) << 63,
+            _ => s(rng) << 32 | s(rng),
+        }
+    };
+    for i in 0..150 * ops.len() {
+        let mut ctx = ThreadContext {
+            pc: CODE,
+            fpcr: match i % 7 {
+                0 | 3 => 1 << 24,
+                5 => 1 << 22,
+                _ => 0,
+            },
+            fpsr: if i % 4 == 0 { 0 } else { 0x10 },
+            ..Default::default()
+        };
+        for v in &mut ctx.v[..3] {
+            *v = u128::from(lane(&mut rng)) << 64 | u128::from(lane(&mut rng));
+        }
+        compare(machines, &[ops[i % ops.len()], BRK], &ctx, &data);
+    }
+}

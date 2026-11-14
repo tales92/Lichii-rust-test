@@ -27,7 +27,10 @@ pub enum LaneOp {
     /// `FADDP`: sums of adjacent lane pairs, those of `n` in the low lanes and those of `m` above.
     AddPairwise,
     Sub,
+    /// `FABD`: `|n - m|`.
+    AbsDiff,
     Mul,
+    Div,
     /// Fused `acc + n * m`.
     Mla,
     /// Fused `acc - n * m`.
@@ -38,6 +41,13 @@ pub enum LaneOp {
     RsqrtStep,
     /// `SCVTF` (vector) on 32-bit lanes of `n`.
     FromInt,
+    /// `UCVTF` (vector) on 32-bit lanes of `n`.
+    FromUint,
+    /// `FCVTZS` (or `FCVTZU` when `unsigned`) on S lanes of `n`; the fixed-point form when the
+    /// instruction is a shift by immediate, which scales `n` by its `2^fbits` first.
+    ToInt {
+        unsigned: bool,
+    },
     /// `FCMEQ`: all ones where `n == m`.
     CompareEq,
     /// `FCMGE`: all ones where `n >= m`.
@@ -245,7 +255,9 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         0x0e20_d400 => Some(LaneOp::Add),
         0x2e20_d400 => Some(LaneOp::AddPairwise),
         0x0ea0_d400 => Some(LaneOp::Sub),
+        0x2ea0_d400 => Some(LaneOp::AbsDiff),
         0x2e20_dc00 => Some(LaneOp::Mul),
+        0x2e20_fc00 => Some(LaneOp::Div),
         0x0e20_cc00 => Some(LaneOp::Mla),
         0x0ea0_cc00 => Some(LaneOp::Mls),
         0x0e20_fc00 => Some(LaneOp::RecipStep),
@@ -265,6 +277,9 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     };
     let unary = |masked: u32| match masked {
         0x0e21_d800 => Some(LaneOp::FromInt),
+        0x2e21_d800 => Some(LaneOp::FromUint),
+        0x0ea1_b800 => Some(LaneOp::ToInt { unsigned: false }),
+        0x2ea1_b800 => Some(LaneOp::ToInt { unsigned: true }),
         0x0ea1_d800 => Some(LaneOp::RecipEstimate),
         0x2ea1_d800 => Some(LaneOp::RsqrtEstimate),
         _ => None,
@@ -302,12 +317,19 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
         (LaneOp::Sqrt, false, vector_lanes)
     } else if let Some(op) = unary(word & 0xbfff_fc00) {
         (op, false, vector_lanes)
-    } else if let Some(op) =
-        unary(word & 0xffff_fc00 ^ 0x5000_0000).filter(|&op| op != LaneOp::FromInt)
+    } else if let Some(op) = unary(word & 0xffff_fc00 ^ 0x5000_0000)
+        .filter(|&op| !matches!(op, LaneOp::FromInt | LaneOp::FromUint))
     {
         (op, false, 1)
+    } else if matches!(word & 0xbfe0_fc00, 0x0f20_fc00 | 0x2f20_fc00) {
+        let unsigned = word >> 29 & 1 != 0;
+        (LaneOp::ToInt { unsigned }, false, vector_lanes)
     } else if let Some(op) = three_same {
         (op, false, vector_lanes)
+    } else if word & 0xffa0_fc00 == 0x7ea0_d400 {
+        (LaneOp::AbsDiff, false, 1)
+    } else if word & 0xffbf_fc00 == 0x7e30_d800 {
+        (LaneOp::AddPairwise, false, 1)
     } else if let Some(op) = by_element(word & 0xbf80_f400) {
         (op, true, vector_lanes)
     } else if let Some(op) = by_element(word & 0xff80_f400 ^ 0x5000_0000) {
@@ -333,8 +355,14 @@ pub(super) fn lower(t: &mut Translator, word: u32) -> bool {
     let n = vec(t, rn);
     let m = if matches!(
         op,
-        LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt
-    ) {
+        LaneOp::FromInt
+            | LaneOp::FromUint
+            | LaneOp::ToInt { .. }
+            | LaneOp::RecipEstimate
+            | LaneOp::RsqrtEstimate
+            | LaneOp::Sqrt
+    ) || (op == LaneOp::AddPairwise && lanes == 1)
+    {
         n
     } else {
         vec(t, rm)
@@ -376,21 +404,29 @@ impl Emitter<'_> {
         let estimate = matches!(op, LaneOp::RecipEstimate | LaneOp::RsqrtEstimate);
         let extreme = matches!(op, LaneOp::Max | LaneOp::Min);
         let written = (1i32 << lanes) - 1;
-        let element = index.map_or(written, |index| 1 << index);
-        let inputs = [(n, written), (m, element), (acc.unwrap_or(n), written)];
+        let read = if op == LaneOp::AddPairwise && lanes == 1 {
+            3
+        } else {
+            written
+        };
+        let element = index.map_or(read, |index| 1 << index);
+        let inputs = [(n, read), (m, element), (acc.unwrap_or(n), written)];
         let count = match (acc, op) {
             (Some(_), _) => 3,
-            (_, LaneOp::Sqrt) => 1,
+            (_, LaneOp::Sqrt | LaneOp::ToInt { .. }) => 1,
             _ => 2,
         };
         let inputs = Inputs::lanes(
             fp,
             &inputs[..count],
-            matches!(op, LaneOp::Add | LaneOp::Sub | LaneOp::AddPairwise),
+            matches!(
+                op,
+                LaneOp::Add | LaneOp::Sub | LaneOp::AbsDiff | LaneOp::AddPairwise
+            ),
         );
         let slow = match op {
             _ if estimate => self.asm.new_dynamic_label(),
-            LaneOp::FromInt => self.checked(true, None),
+            LaneOp::FromInt | LaneOp::FromUint => self.checked(true, None),
             _ => self.checked(!compare && !extreme, Some(inputs)),
         };
         let fused = matches!(
@@ -428,7 +464,12 @@ impl Emitter<'_> {
             dynasm!(self.asm ; .arch x64 ; test eax, written ; jnz =>slow);
         }
         match op {
-            LaneOp::FromInt | LaneOp::RecipEstimate | LaneOp::RsqrtEstimate | LaneOp::Sqrt => {}
+            LaneOp::FromInt
+            | LaneOp::FromUint
+            | LaneOp::ToInt { .. }
+            | LaneOp::RecipEstimate
+            | LaneOp::RsqrtEstimate
+            | LaneOp::Sqrt => {}
             LaneOp::CompareGe | LaneOp::CompareGt => {
                 dynasm!(self.asm ; .arch x64 ; movaps Rx(d), Rx(m))
             }
@@ -445,6 +486,24 @@ impl Emitter<'_> {
         }
         match (op, fp) {
             (LaneOp::FromInt, _) => dynasm!(self.asm ; .arch x64 ; cvtdq2ps Rx(d), Rx(n)),
+            (LaneOp::FromUint, _) => dynasm!(self.asm
+                ; .arch x64
+                ; movaps Rx(d), Rx(n)
+                ; psrld Rx(d), 16
+                ; cvtdq2ps Rx(d), Rx(d)
+                ; mov eax, 0x4780_0000
+                ; movd xmm15, eax
+                ; pshufd xmm15, xmm15, 0
+                ; mulps Rx(d), xmm15
+                ; movaps xmm15, Rx(n)
+                ; pslld xmm15, 16
+                ; psrld xmm15, 16
+                ; cvtdq2ps xmm15, xmm15
+                ; addps Rx(d), xmm15
+            ),
+            (LaneOp::ToInt { unsigned }, _) => {
+                self.truncate_lanes(unsigned, word, lanes, d, n, slow)
+            }
             (LaneOp::Sqrt, Fp::S) => dynasm!(self.asm ; .arch x64 ; sqrtps Rx(d), Rx(n)),
             (LaneOp::Sqrt, Fp::D) => dynasm!(self.asm ; .arch x64 ; sqrtpd Rx(d), Rx(n)),
             (LaneOp::Max, Fp::S) => dynasm!(self.asm
@@ -525,6 +584,22 @@ impl Emitter<'_> {
             (LaneOp::Add, Fp::D) => dynasm!(self.asm ; .arch x64 ; addpd Rx(d), Rx(b)),
             (LaneOp::Sub, Fp::S) => dynasm!(self.asm ; .arch x64 ; subps Rx(d), Rx(b)),
             (LaneOp::Sub, Fp::D) => dynasm!(self.asm ; .arch x64 ; subpd Rx(d), Rx(b)),
+            (LaneOp::AbsDiff, Fp::S) => dynasm!(self.asm
+                ; .arch x64
+                ; subps Rx(d), Rx(m)
+                ; pcmpeqd xmm15, xmm15
+                ; psrld xmm15, 1
+                ; andps Rx(d), xmm15
+            ),
+            (LaneOp::AbsDiff, Fp::D) => dynasm!(self.asm
+                ; .arch x64
+                ; subpd Rx(d), Rx(m)
+                ; pcmpeqd xmm15, xmm15
+                ; psrlq xmm15, 1
+                ; andps Rx(d), xmm15
+            ),
+            (LaneOp::Div, Fp::S) => dynasm!(self.asm ; .arch x64 ; divps Rx(d), Rx(m)),
+            (LaneOp::Div, Fp::D) => dynasm!(self.asm ; .arch x64 ; divpd Rx(d), Rx(m)),
             (LaneOp::Mul, Fp::S) => dynasm!(self.asm ; .arch x64 ; mulps Rx(d), Rx(b)),
             (LaneOp::Mul, Fp::D) => dynasm!(self.asm ; .arch x64 ; mulpd Rx(d), Rx(b)),
             (LaneOp::Mla, Fp::S) => dynasm!(self.asm ; .arch x64 ; vfmadd231ps Rx(d), Rx(n), Rx(b)),
@@ -534,7 +609,11 @@ impl Emitter<'_> {
             }
             (LaneOp::Mls, Fp::D) => self.fma231pd(0xbc, d, n, b),
         }
-        if op != LaneOp::FromInt && !compare && !estimate && !extreme {
+        let converts = matches!(
+            op,
+            LaneOp::FromInt | LaneOp::FromUint | LaneOp::ToInt { .. }
+        );
+        if !converts && !compare && !estimate && !extreme {
             self.check_lanes(op, fp, lanes, d, n, m, index, slow);
         }
         match (fp, lanes) {
@@ -687,22 +766,24 @@ impl Emitter<'_> {
         );
         self.compare_bound(fp, 16, LT);
         self.lane_mask(fp, RCX);
-        if matches!(op, LaneOp::Mul | LaneOp::Mla | LaneOp::Mls) {
+        if matches!(op, LaneOp::Mul | LaneOp::Mla | LaneOp::Mls | LaneOp::Div) {
             dynasm!(self.asm ; .arch x64 ; movaps xmm15, Rx(d) ; andps xmm15, [rax]);
             self.compare_bound(fp, 32, NLE);
             self.lane_mask(fp, RDX);
             dynasm!(self.asm ; .arch x64 ; and ecx, edx);
             self.zero_lanes(fp, n, RAX);
-            self.zero_lanes(fp, m, RDX);
-            if let Some(index) = index {
-                dynasm!(self.asm
-                    ; .arch x64
-                    ; shr edx, index as i8
-                    ; and edx, 1
-                    ; neg edx
-                );
+            if op != LaneOp::Div {
+                self.zero_lanes(fp, m, RDX);
+                if let Some(index) = index {
+                    dynasm!(self.asm
+                        ; .arch x64
+                        ; shr edx, index as i8
+                        ; and edx, 1
+                        ; neg edx
+                    );
+                }
+                dynasm!(self.asm ; .arch x64 ; or eax, edx);
             }
-            dynasm!(self.asm ; .arch x64 ; or eax, edx);
             self.zero_lanes(fp, d, RDX);
             dynasm!(self.asm ; .arch x64 ; and eax, edx ; or ecx, eax);
         }
@@ -726,6 +807,49 @@ impl Emitter<'_> {
             opcode,
             0xc0 | (d & 7) << 3 | (b & 7),
         ]);
+    }
+
+    /// `FCVTZS`/`FCVTZU` of the S lanes of `xmm n` into `xmm d`, scaled by `2^fbits` first for
+    /// the fixed-point form. `CVTTPS2DQ` gives `0x8000_0000` for a NaN or an out-of-range lane, so
+    /// that value in a written lane jumps to `slow`, as does any negative lane when `unsigned`:
+    /// those are the lanes that saturate on Arm. Scaling by a power of two is exact short of
+    /// overflow, which gives an infinity and so `0x8000_0000`. Clobbers `xmm15` and `rax`.
+    fn truncate_lanes(
+        &mut self,
+        unsigned: bool,
+        word: u32,
+        lanes: u8,
+        d: u8,
+        n: u8,
+        slow: dynasmrt::DynamicLabel,
+    ) {
+        let written = (1i32 << lanes) - 1;
+        if word >> 24 & 1 != 0 {
+            let fbits = 64 - (word >> 16 & 0x7f) as i32;
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov eax, (127 + fbits) << 23
+                ; movd xmm15, eax
+                ; pshufd xmm15, xmm15, 0
+                ; mulps xmm15, Rx(n)
+                ; cvttps2dq Rx(d), xmm15
+            );
+        } else {
+            dynasm!(self.asm ; .arch x64 ; cvttps2dq Rx(d), Rx(n));
+        }
+        if !unsigned {
+            dynasm!(self.asm
+                ; .arch x64
+                ; mov eax, 0x8000_0000u32 as i32
+                ; movd xmm15, eax
+                ; pshufd xmm15, xmm15, 0
+                ; pcmpeqd xmm15, Rx(d)
+                ; movmskps eax, xmm15
+            );
+        } else {
+            dynasm!(self.asm ; .arch x64 ; movmskps eax, Rx(d));
+        }
+        dynasm!(self.asm ; .arch x64 ; test eax, written ; jnz =>slow);
     }
 
     /// Compares `xmm15` with the bound at `[rax + offset]` lane by lane.
