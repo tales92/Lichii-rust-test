@@ -46,8 +46,8 @@ pub(super) const STAND_INS: [&[u8]; FONT_COUNT] = [
 /// Plain TrueType/OpenType data of each font type, `None` when the font was not found.
 pub(super) type FontData = [Option<Vec<u8>>; FONT_COUNT];
 
-/// Looks for every font: first in the NAND system archives, then in the fonts directory. Without
-/// any font in either, every type gets its stand-in.
+/// Looks for every font: first in the NAND system archives, then in the fonts directory. Each
+/// missing type gets its stand-in, preserving every real font that was found.
 pub(super) fn find(settings: &Settings) -> FontData {
     let nand = settings
         .paths
