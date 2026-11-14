@@ -202,7 +202,7 @@ fn serves_font_files_through_the_switch_1_shared_memory() {
         let header: Vec<u32> =
             bytemuck::pod_collect_to_vec(&read(&memory, u64::from(offset - 8), 8));
         assert_eq!(header, [0x1802_9a7f, font.len() as u32 ^ FONT_KEY]);
-        assert_eq!(&read(&memory, u64::from(offset), font.len()), *font);
+        assert_eq!(read(&memory, u64::from(offset), font.len()), font.to_vec());
     }
 
     let (loaded, count, [codes, offsets, sizes]) = priority_list(&client, pl);
@@ -217,7 +217,9 @@ fn serves_font_files_through_the_switch_1_shared_memory() {
         .collect::<Vec<_>>();
     assert_eq!(offsets, expected_offsets);
     assert_eq!(sizes, expected_sizes);
-}#[test]
+}
+
+#[test]
 fn serves_plain_font_copies_to_switch_2_titles() {
     let dir = TempDir::new("switch2");
     let standard = synthetic_font(0x10, 37);
@@ -262,7 +264,7 @@ fn serves_plain_font_copies_to_switch_2_titles() {
     assert_eq!(read(&builtin, 0, standard.len()), standard);
     assert_eq!(
         read(&builtin, u64::from(type_1_offset), STAND_INS[1].len()),
-        STAND_INS[1]
+        STAND_INS[1].to_vec()
     );
     assert_eq!(
         read(&builtin, u64::from(extension_offset), extension.len()),
@@ -306,7 +308,9 @@ fn serves_plain_font_copies_to_switch_2_titles() {
         )
         .unwrap();
     assert_eq!(reply.result, lichii_kernel::result::INVALID_SIZE);
-}#[test]
+}
+
+#[test]
 fn switch_2_standard_font_gets_the_button_icons() {
     let dir = TempDir::new("icons");
     let standard = font_merge::tests::font(
@@ -396,7 +400,9 @@ fn switch_2_standard_font_gets_the_button_icons() {
         standard,
         "Switch 1 titles keep the firmware font"
     );
-}#[test]
+}
+
+#[test]
 fn without_fonts_serves_the_open_source_stand_ins() {
     let dir = TempDir::new("stand-ins");
     let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
