@@ -3,6 +3,7 @@ name: Release
 # Fork build based on upstream zortos293/Lichii-rust commit ea9c5997b73683da2a814fd71bfdcbc85083847f.
 
 # Publish only after CI succeeds on main. Manual runs are restricted to main as well.
+# Each successful main CI commit produces a separate, versioned Windows x64 pre-release.
 on:
   workflow_dispatch:
   workflow_run:
