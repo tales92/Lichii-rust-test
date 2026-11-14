@@ -174,8 +174,6 @@ pub(super) fn shared_memory_header(size: u32) -> [u8; 8] {
     header[4..].copy_from_slice(&(size ^ FONT_KEY).to_le_bytes());
     header
 }
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
