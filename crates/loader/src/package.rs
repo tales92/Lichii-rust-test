@@ -1132,5 +1132,4 @@ mod tests {
         assert!(!is_application_program_id(application | 0x0800));
         assert!(!is_application_program_id(application | 0x1000));
     }
-
 }
