@@ -275,6 +275,15 @@ enum MetadataError {
     Unavailable,
 }
 
+fn classify_metadata_error(error: &LoaderError) -> MetadataError {
+    match error {
+        LoaderError::MissingProgram(_)
+        | LoaderError::NotATitle(_)
+        | LoaderError::MissingNupProgram(_) => MetadataError::NotBootable,
+        _ => MetadataError::Unavailable,
+    }
+}
+
 /// Reads a title's metadata, rejecting confirmed update/DLC-only containers while preserving
 /// unreadable entries so missing keys never make a valid game disappear.
 fn read_metadata(
@@ -297,12 +306,7 @@ fn read_metadata(
         Ok(info) => info,
         Err(error) => {
             tracing::debug!(path = %entry.path.display(), "no title metadata: {error}");
-            return Err(match error {
-                LoaderError::MissingProgram(_)
-                | LoaderError::NotATitle(_)
-                | LoaderError::MissingNupProgram(_) => MetadataError::NotBootable,
-                _ => MetadataError::Unavailable,
-            });
+            return Err(classify_metadata_error(&error));
         }
     };
     let meta = Metadata {
@@ -559,6 +563,25 @@ pub fn format_size(bytes: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_confirmed_non_bootable_packages_are_rejected() {
+        for error in [
+            LoaderError::MissingProgram("update.nsp".into()),
+            LoaderError::NotATitle("addon.nca".into()),
+            LoaderError::MissingNupProgram("update.nup".into()),
+        ] {
+            assert_eq!(classify_metadata_error(&error), MetadataError::NotBootable);
+        }
+
+        let missing_key = LoaderError::Key(lichii_crypto::KeyError::Missing("header_key".into()));
+        assert_eq!(
+            classify_metadata_error(&missing_key),
+            MetadataError::Unavailable
+        );
+        let io = LoaderError::Io(std::io::Error::other("unreadable package"));
+        assert_eq!(classify_metadata_error(&io), MetadataError::Unavailable);
+    }
 
     struct TempDir(PathBuf);
 
