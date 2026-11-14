@@ -37,7 +37,7 @@ jobs:
         id: version
         shell: pwsh
         run: |
-          $match = Select-String -Path Cargo.toml -Pattern '^version\\s*=\\s*"([^"]+)"' | Select-Object -First 1
+          $match = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
           if (-not $match) { throw "Could not read [workspace.package] version from Cargo.toml" }
           $version = $match.Matches[0].Groups[1].Value
           "version=$version" >> $env:GITHUB_OUTPUT
