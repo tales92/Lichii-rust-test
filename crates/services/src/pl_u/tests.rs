@@ -116,6 +116,30 @@ fn priority_list(client: &IpcClient, pl: Handle) -> (u8, u32, [Vec<u32>; 3]) {
     (get(&reply, 0), count, list)
 }
 
+fn shared_font_offset(fonts: &[&[u8]], font_type: usize) -> u32 {
+    let mut offset = 0u64;
+    for font in fonts.iter().take(font_type) {
+        offset += 8 + (font.len() as u64).next_multiple_of(4);
+    }
+    (offset + 8) as u32
+}
+
+fn builtin_font_offset(fonts: &[&[u8]], font_type: usize) -> u32 {
+    let mut offset = 0u64;
+    for font in fonts.iter().take(font_type) {
+        offset = (offset + font.len() as u64 + 0xfff) & !0xfff;
+    }
+    offset as u32
+}
+
+fn builtin_memory_size(fonts: &[&[u8]]) -> u32 {
+    let mut offset = 0u64;
+    for font in fonts {
+        offset = (offset + font.len() as u64 + 0xfff) & !0xfff;
+    }
+    offset.max(0x1000) as u32
+}
+
 /// A heap range of the client's process lent as transfer memory; returns its address and handle.
 fn transfer_memory(client: &IpcClient, offset: u64, size: u64) -> (u64, Handle) {
     let process = client.process();
@@ -150,34 +174,50 @@ fn serves_font_files_through_the_switch_1_shared_memory() {
     )
     .unwrap();
     let (_context, client, pl) = boot(SWITCH1_TITLE, &dir);
+    let fonts: [&[u8]; 7] = [
+        &standard,
+        STAND_INS[1],
+        STAND_INS[2],
+        STAND_INS[3],
+        STAND_INS[4],
+        &extension,
+        STAND_INS[6],
+    ];
 
     let value = |command: u32, font_type: u32| -> u32 {
         get(&send(&client, pl, Request::new(command).arg(font_type)), 0)
     };
     assert_eq!(value(1, 0), LOADED);
-    assert_eq!(value(2, 0), 37);
-    assert_eq!(value(2, 5), 40);
-    assert_eq!(value(2, 1), 0);
-    assert_eq!(value(3, 0), 8);
-    assert_eq!(value(3, 5), 8 + 40 + 8);
+    assert_eq!(value(2, 0), standard.len() as u32);
+    assert_eq!(value(2, 5), extension.len() as u32);
+    assert_eq!(value(2, 1), STAND_INS[1].len() as u32);
+    assert_eq!(value(3, 0), shared_font_offset(&fonts, 0));
+    assert_eq!(value(3, 5), shared_font_offset(&fonts, 5));
 
     let handle = send(&client, pl, Request::new(4)).copy_handles[0];
     let memory = shared_memory(&client, handle);
     assert_eq!(memory.size(), SHARED_FONT_MEMORY_SIZE);
-    for (offset, font) in [(8u64, &standard), (56, &extension)] {
-        let header: Vec<u32> = bytemuck::pod_collect_to_vec(&read(&memory, offset - 8, 8));
+    for (font_type, font) in fonts.iter().enumerate() {
+        let offset = shared_font_offset(&fonts, font_type);
+        let header: Vec<u32> =
+            bytemuck::pod_collect_to_vec(&read(&memory, u64::from(offset - 8), 8));
         assert_eq!(header, [0x1802_9a7f, font.len() as u32 ^ FONT_KEY]);
-        assert_eq!(&read(&memory, offset, font.len()), font);
+        assert_eq!(&read(&memory, u64::from(offset), font.len()), *font);
     }
 
     let (loaded, count, [codes, offsets, sizes]) = priority_list(&client, pl);
-    assert_eq!((loaded, count), (1, 2));
-    assert_eq!(codes, [0, 5]);
-    assert_eq!(offsets, [8, 56]);
-    assert_eq!(sizes, [37, 40]);
-}
-
-#[test]
+    assert_eq!((loaded, count), (1, 6));
+    assert_eq!(codes, [0, 1, 2, 3, 4, 5]);
+    let expected_offsets = (0..6)
+        .map(|font_type| shared_font_offset(&fonts, font_type))
+        .collect::<Vec<_>>();
+    let expected_sizes = fonts[..6]
+        .iter()
+        .map(|font| font.len() as u32)
+        .collect::<Vec<_>>();
+    assert_eq!(offsets, expected_offsets);
+    assert_eq!(sizes, expected_sizes);
+}#[test]
 fn serves_plain_font_copies_to_switch_2_titles() {
     let dir = TempDir::new("switch2");
     let standard = synthetic_font(0x10, 37);
@@ -189,44 +229,70 @@ fn serves_plain_font_copies_to_switch_2_titles() {
     )
     .unwrap();
     let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
+    let fonts: [&[u8]; 7] = [
+        &standard,
+        STAND_INS[1],
+        STAND_INS[2],
+        STAND_INS[3],
+        STAND_INS[4],
+        &extension,
+        STAND_INS[6],
+    ];
+    let type_1_offset = builtin_font_offset(&fonts, 1);
+    let extension_offset = builtin_font_offset(&fonts, 5);
+    let builtin_size = builtin_memory_size(&fonts);
 
     assert_eq!(
         font_data(&client, pl, Request::new(2010).arg(0x0105u32)),
-        (1, 0x1000, 40)
+        (1, extension_offset, extension.len() as u32)
     );
     assert_eq!(
         font_data(&client, pl, Request::new(2010).arg(0u32)),
-        (1, 0, 37)
+        (1, 0, standard.len() as u32)
     );
     assert_eq!(
         font_data(&client, pl, Request::new(2010).arg(1u32)),
-        (0, 0, 0)
+        (1, type_1_offset, STAND_INS[1].len() as u32)
     );
 
     let reply = send(&client, pl, Request::new(2000));
-    assert_eq!(get::<u32>(&reply, 0), 0x2000);
+    assert_eq!(get::<u32>(&reply, 0), builtin_size);
     let builtin = shared_memory(&client, reply.copy_handles[0]);
-    assert_eq!(builtin.size(), 0x2000);
-    assert_eq!(read(&builtin, 0, 37), standard);
-    assert_eq!(read(&builtin, 0x1000, 40), extension);
+    assert_eq!(builtin.size(), u64::from(builtin_size));
+    assert_eq!(read(&builtin, 0, standard.len()), standard);
+    assert_eq!(
+        read(&builtin, u64::from(type_1_offset), STAND_INS[1].len()),
+        STAND_INS[1]
+    );
+    assert_eq!(
+        read(&builtin, u64::from(extension_offset), extension.len()),
+        extension
+    );
 
-    let (address, transfer) = transfer_memory(&client, 0, 0x4000);
+    let (address, transfer) = transfer_memory(&client, 0, u64::from(builtin_size));
     let reply = send(
         &client,
         pl,
         Request::new(2100)
             .arg(0u32)
-            .arg(0x4000u32)
+            .arg(builtin_size)
             .copy_handle(transfer),
     );
-    let fonts = reply.move_handles[0];
+    let fonts_session = reply.move_handles[0];
     assert_eq!(
-        font_data(&client, fonts, Request::new(0).arg(5u32)),
-        (1, 0x1000, 40)
+        font_data(&client, fonts_session, Request::new(0).arg(5u32)),
+        (1, extension_offset, extension.len() as u32)
     );
-    assert_eq!(client.read(address, 37), standard);
-    assert_eq!(client.read(address + 0x1000, 40), extension);
-    let stub = send(&client, fonts, Request::new(9));
+    assert_eq!(client.read(address, standard.len()), standard);
+    assert_eq!(
+        client.read(address + u64::from(type_1_offset), STAND_INS[1].len()),
+        STAND_INS[1]
+    );
+    assert_eq!(
+        client.read(address + u64::from(extension_offset), extension.len()),
+        extension
+    );
+    let stub = send(&client, fonts_session, Request::new(9));
     assert_eq!(stub.data(), [0; 128], "nx2:pl:font auto-stubs the rest");
 
     let (_, small) = transfer_memory(&client, 0x10_0000, 0x1000);
@@ -240,9 +306,7 @@ fn serves_plain_font_copies_to_switch_2_titles() {
         )
         .unwrap();
     assert_eq!(reply.result, lichii_kernel::result::INVALID_SIZE);
-}
-
-#[test]
+}#[test]
 fn switch_2_standard_font_gets_the_button_icons() {
     let dir = TempDir::new("icons");
     let standard = font_merge::tests::font(
@@ -269,29 +333,61 @@ fn switch_2_standard_font_gets_the_button_icons() {
     std::fs::write(dir.0.join("fonts/nintendo_ext_003.ttf"), &extension).unwrap();
     let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
 
-    let size = merged.len() as u32;
+    let fonts: [&[u8]; 7] = [
+        &merged,
+        STAND_INS[1],
+        STAND_INS[2],
+        STAND_INS[3],
+        STAND_INS[4],
+        &extension,
+        STAND_INS[6],
+    ];
+    let extension_offset = builtin_font_offset(&fonts, 5);
+    let type_1_offset = builtin_font_offset(&fonts, 1);
+    let builtin_size = builtin_memory_size(&fonts);
     assert_eq!(
         font_data(&client, pl, Request::new(2010).arg(0u32)),
-        (1, 0, size)
+        (1, 0, merged.len() as u32)
     );
-    let extension_offset = size.next_multiple_of(0x1000);
+    assert_eq!(
+        font_data(&client, pl, Request::new(2010).arg(1u32)),
+        (1, type_1_offset, STAND_INS[1].len() as u32)
+    );
     assert_eq!(
         font_data(&client, pl, Request::new(2010).arg(5u32)),
         (1, extension_offset, extension.len() as u32)
     );
     let reply = send(&client, pl, Request::new(2000));
+    assert_eq!(get::<u32>(&reply, 0), builtin_size);
     let builtin = shared_memory(&client, reply.copy_handles[0]);
+    assert_eq!(builtin.size(), u64::from(builtin_size));
     assert_eq!(read(&builtin, 0, merged.len()), merged);
-    let (address, transfer) = transfer_memory(&client, 0, 0x4000);
+    assert_eq!(
+        read(&builtin, u64::from(type_1_offset), STAND_INS[1].len()),
+        STAND_INS[1]
+    );
+    assert_eq!(
+        read(&builtin, u64::from(extension_offset), extension.len()),
+        extension
+    );
+    let (address, transfer) = transfer_memory(&client, 0, u64::from(builtin_size));
     send(
         &client,
         pl,
         Request::new(2100)
             .arg(0u32)
-            .arg(0x4000u32)
+            .arg(builtin_size)
             .copy_handle(transfer),
     );
     assert_eq!(client.read(address, merged.len()), merged);
+    assert_eq!(
+        client.read(address + u64::from(type_1_offset), STAND_INS[1].len()),
+        STAND_INS[1]
+    );
+    assert_eq!(
+        client.read(address + u64::from(extension_offset), extension.len()),
+        extension
+    );
 
     let handle = send(&client, pl, Request::new(4)).copy_handles[0];
     let switch1 = shared_memory(&client, handle);
@@ -300,9 +396,7 @@ fn switch_2_standard_font_gets_the_button_icons() {
         standard,
         "Switch 1 titles keep the firmware font"
     );
-}
-
-#[test]
+}#[test]
 fn without_fonts_serves_the_open_source_stand_ins() {
     let dir = TempDir::new("stand-ins");
     let (_context, client, pl) = boot(SWITCH2_TITLE, &dir);
