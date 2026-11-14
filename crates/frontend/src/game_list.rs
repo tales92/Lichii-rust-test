@@ -861,7 +861,7 @@ mod tests {
         tmp.file("Locked.nsp", 0x400);
         let cache = MetadataCache::new(tmp.0.join("cache"), &tmp.0.join("keys"), &[]);
         let game = scan(std::slice::from_ref(&tmp.0)).remove(0);
-        assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_none());
+        assert!(read_metadata(&game, &LoadOptions::default(), Some(&cache)).is_err());
         assert!(!cache.dir.exists());
         assert_eq!(game.title(), "Locked");
     }
