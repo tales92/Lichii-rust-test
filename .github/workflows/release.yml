@@ -38,6 +38,8 @@ jobs:
         shell: pwsh
         run: |
           Copy-Item target/release/lichii.exe dist/
+          Copy-Item LICENSE dist/LICENSE-LICHII.txt
+          Set-Content -Path dist/VERSION.txt -Value "${{ steps.version.outputs.version }}" -Encoding ascii
           @"
           Lichii Rust v${{ steps.version.outputs.version }} — Windows x64
 
